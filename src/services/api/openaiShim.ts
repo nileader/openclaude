@@ -345,6 +345,17 @@ function hasCerebrasApiHost(baseUrl: string | undefined): boolean {
   }
 }
 
+export function hasMistralApiHost(baseUrl: string | undefined): boolean {
+  if (!baseUrl) return false
+
+  try {
+    const host = new URL(baseUrl).hostname.toLowerCase()
+    return host === 'api.mistral.ai' || host.endsWith('.mistral.ai')
+  } catch {
+    return false
+  }
+}
+
 function formatRetryAfterHint(response: Response): string {
   const ra = response.headers.get('retry-after')
   return ra ? ` (Retry-After: ${ra})` : ''
@@ -3406,10 +3417,16 @@ class OpenAIShimMessages {
       isGeminiMode() ||
       hasGeminiApiHost(request.baseUrl) ||
       hasCerebrasApiHost(request.baseUrl) ||
+      hasMistralApiHost(request.baseUrl) ||
       isLocal
 
+    // Mistral's chat completions reject `max_completion_tokens` (and `store`).
+    // When the route resolves to the Mistral descriptor the config already maps
+    // to `max_tokens`; on the host-detected fallback (`hasMistralApiHost`) the
+    // generic default leaves `max_completion_tokens`, so map it here too.
     if (
-      shimConfig.maxTokensField === 'max_tokens' &&
+      (shimConfig.maxTokensField === 'max_tokens' ||
+        hasMistralApiHost(request.baseUrl)) &&
       body.max_completion_tokens !== undefined
     ) {
       body.max_tokens = body.max_completion_tokens
