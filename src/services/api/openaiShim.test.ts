@@ -5,6 +5,10 @@ import { asMockFetch } from '../../test/typedMocks.js'
 import { _clearRegistryForTesting, ensureIntegrationsLoaded, registerGateway } from '../../integrations/index.ts'
 import { applyProviderFlag } from '../../utils/providerFlag.ts'
 import { applyProviderProfileToProcessEnv } from '../../utils/providerProfiles.ts'
+import {
+  getAssistantMessageFromError,
+  OPENCODE_GO_FREE_LIMIT_ERROR_MESSAGE,
+} from './errors.ts'
 import { createOpenAIShimClient, hasMistralApiHost } from './openaiShim.ts'
 import * as realCodexShim from './codexShim.js'
 import * as realGithubModelsCredentials from '../../utils/githubModelsCredentials.js'
@@ -9721,4 +9725,310 @@ test('GitHub Copilot 401 chat_completions with providerOverride does not trigger
   } finally {
     mock.module('../../utils/githubModelsCredentials.js', () => realGithubModule)
   }
+})
+
+// --- JSON fallback regression tests (#1749) -------------------------------
+// Some OpenAI-compatible providers ignore `stream: true` and return a full
+// `application/json` chat completion. The fallback inside
+// openaiStreamToAnthropic must route that response through the same
+// non-streaming converter so tool_calls, Anthropic stop reasons, array
+// content, and <think> stripping are all preserved (jatmn CHANGES_REQUESTED).
+
+function makeJsonChatCompletion(body: Record<string, unknown>): Response {
+  return new Response(JSON.stringify(body), {
+    headers: { 'Content-Type': 'application/json' },
+  })
+}
+
+async function collectFallbackEvents(
+  body: Record<string, unknown>,
+): Promise<Array<Record<string, unknown>>> {
+  const previousFetch = globalThis.fetch
+  globalThis.fetch = (async () => makeJsonChatCompletion(body)) as unknown as FetchType
+  try {
+    const client = createOpenAIShimClient({}) as OpenAIShimClient
+    const result = await client.beta.messages
+      .create({
+        model: 'fake-model',
+        messages: [{ role: 'user', content: 'hi' }],
+        max_tokens: 64,
+        stream: true,
+      })
+      .withResponse()
+    const events: Array<Record<string, unknown>> = []
+    for await (const event of result.data) {
+      events.push(event)
+    }
+    return events
+  } finally {
+    // Restore so the global fetch stub does not leak past this helper.
+    globalThis.fetch = previousFetch
+  }
+}
+
+test('JSON fallback: preserves tool_calls as a tool_use block', async () => {
+  const events = await collectFallbackEvents({
+    id: 'chatcmpl-json-tool',
+    model: 'fake-model',
+    choices: [
+      {
+        message: {
+          role: 'assistant',
+          content: null,
+          tool_calls: [
+            {
+              id: 'call_1',
+              type: 'function',
+              function: { name: 'Bash', arguments: '{"command":"pwd"}' },
+            },
+          ],
+        },
+        finish_reason: 'tool_calls',
+      },
+    ],
+  })
+
+  const toolStart = events.find(
+    event =>
+      event.type === 'content_block_start' &&
+      typeof event.content_block === 'object' &&
+      event.content_block !== null &&
+      (event.content_block as Record<string, unknown>).type === 'tool_use',
+  ) as { content_block?: Record<string, unknown> } | undefined
+  expect(toolStart?.content_block).toMatchObject({
+    type: 'tool_use',
+    id: 'call_1',
+    name: 'Bash',
+  })
+
+  const inputDelta = events.find(
+    event =>
+      event.type === 'content_block_delta' &&
+      typeof event.delta === 'object' &&
+      event.delta !== null &&
+      (event.delta as Record<string, unknown>).type === 'input_json_delta',
+  ) as { delta?: { partial_json?: string } } | undefined
+  expect(JSON.parse(inputDelta?.delta?.partial_json ?? '{}')).toEqual({
+    command: 'pwd',
+  })
+
+  const stopEvent = events.find(e => e.type === 'message_delta') as
+    | { delta?: { stop_reason?: string } }
+    | undefined
+  expect(stopEvent?.delta?.stop_reason).toBe('tool_use')
+})
+
+test('JSON fallback: maps finish_reason=length to max_tokens', async () => {
+  const events = await collectFallbackEvents({
+    id: 'chatcmpl-json-len',
+    model: 'fake-model',
+    choices: [
+      { message: { role: 'assistant', content: 'partial' }, finish_reason: 'length' },
+    ],
+  })
+  const stopEvent = events.find(e => e.type === 'message_delta') as
+    | { delta?: { stop_reason?: string } }
+    | undefined
+  expect(stopEvent?.delta?.stop_reason).toBe('max_tokens')
+})
+
+test('JSON fallback: preserves OpenCode Go quota error guidance', async () => {
+  process.env.OPENAI_BASE_URL = 'https://opencode.ai/zen/go/v1'
+  const previousFetch = globalThis.fetch
+  globalThis.fetch = (async () =>
+    withResponseUrl(
+      makeJsonChatCompletion({
+        error: {
+          type: 'FreeUsageLimitError',
+          message: 'free usage limit reached',
+        },
+      }),
+      'https://opencode.ai/zen/go/v1/chat/completions',
+    )) as unknown as FetchType
+
+  try {
+    const client = createOpenAIShimClient({}) as OpenAIShimClient
+    const result = await client.beta.messages
+      .create({
+        model: 'fake-model',
+        messages: [{ role: 'user', content: 'hi' }],
+        max_tokens: 64,
+        stream: true,
+      })
+      .withResponse()
+
+    let caught: unknown
+    try {
+      for await (const _event of result.data) {
+        // Consume until the JSON error is surfaced.
+      }
+    } catch (error) {
+      caught = error
+    }
+
+    expect(caught).toBeInstanceOf(APIError)
+    const apiError = caught as APIError
+    expect(apiError.headers?.get('x-opencode-request-url')).toBe(
+      'https://opencode.ai/zen/go/v1/chat/completions',
+    )
+    const message = getAssistantMessageFromError(apiError, 'glm-5.1')
+    const first = message.message.content[0]
+    expect(typeof first === 'object' && first && 'text' in first ? first.text : '').toBe(
+      OPENCODE_GO_FREE_LIMIT_ERROR_MESSAGE,
+    )
+  } finally {
+    globalThis.fetch = previousFetch
+  }
+})
+
+test('JSON fallback: strips <think> tags from emitted text', async () => {
+  const events = await collectFallbackEvents({
+    id: 'chatcmpl-json-think',
+    model: 'fake-model',
+    choices: [
+      {
+        message: { role: 'assistant', content: '<think>private plan</think>visible answer' },
+        finish_reason: 'stop',
+      },
+    ],
+  })
+  const textDelta = events.find(
+    event =>
+      event.type === 'content_block_delta' &&
+      typeof event.delta === 'object' &&
+      event.delta !== null &&
+      (event.delta as Record<string, unknown>).type === 'text_delta',
+  ) as { delta?: { text?: string } } | undefined
+  expect(textDelta?.delta?.text).toBe('visible answer')
+  expect(textDelta?.delta?.text).not.toContain('private plan')
+})
+
+test('JSON fallback: normalizes array content into a text string', async () => {
+  const events = await collectFallbackEvents({
+    id: 'chatcmpl-json-array',
+    model: 'fake-model',
+    choices: [
+      {
+        message: {
+          role: 'assistant',
+          content: [
+            { type: 'text', text: 'line one' },
+            { type: 'text', text: 'line two' },
+          ],
+        },
+        finish_reason: 'stop',
+      },
+    ],
+  })
+  const textDelta = events.find(
+    event =>
+      event.type === 'content_block_delta' &&
+      typeof event.delta === 'object' &&
+      event.delta !== null &&
+      (event.delta as Record<string, unknown>).type === 'text_delta',
+  ) as { delta?: { text?: unknown } } | undefined
+  expect(typeof textDelta?.delta?.text).toBe('string')
+  expect(textDelta?.delta?.text).toBe('line one\nline two')
+})
+
+test('JSON fallback: recovers raw-text tool call into tool_use block', async () => {
+  const events = await collectFallbackEvents({
+    id: 'chatcmpl-json-raw',
+    model: 'fake-model',
+    choices: [
+      {
+        message: {
+          role: 'assistant',
+          // Same "Tool calls requested:" recovery format the non-streaming
+          // converter already handles (parseRawToolCallsRequestedText).
+          content:
+            'Tool calls requested:\n- Bash({"command":"ls"}) [id: call_raw_1]',
+        },
+        finish_reason: 'stop',
+      },
+    ],
+  })
+  const toolStart = events.find(
+    event =>
+      event.type === 'content_block_start' &&
+      typeof event.content_block === 'object' &&
+      event.content_block !== null &&
+      (event.content_block as Record<string, unknown>).type === 'tool_use',
+  ) as { content_block?: Record<string, unknown> } | undefined
+  expect(toolStart?.content_block).toMatchObject({
+    type: 'tool_use',
+    id: 'call_raw_1',
+    name: 'Bash',
+  })
+  const stopEvent = events.find(e => e.type === 'message_delta') as
+    | { delta?: { stop_reason?: string } }
+    | undefined
+  expect(stopEvent?.delta?.stop_reason).toBe('tool_use')
+
+})
+
+test('JSON fallback: empty tool_calls array does not block raw-text recovery', async () => {
+  // tool_calls: [] is truthy; it must be treated as "no structured tool calls"
+  // so the raw "Tool calls requested" recovery still runs.
+  const events = await collectFallbackEvents({
+    id: 'chatcmpl-json-empty-tc',
+    model: 'fake-model',
+    choices: [
+      {
+        message: {
+          role: 'assistant',
+          tool_calls: [],
+          content:
+            'Tool calls requested:\n- Bash({"command":"ls"}) [id: call_empty_tc]',
+        },
+        finish_reason: 'stop',
+      },
+    ],
+  })
+  const toolStart = events.find(
+    event =>
+      event.type === 'content_block_start' &&
+      typeof event.content_block === 'object' &&
+      event.content_block !== null &&
+      (event.content_block as Record<string, unknown>).type === 'tool_use',
+  ) as { content_block?: Record<string, unknown> } | undefined
+  expect(toolStart?.content_block).toMatchObject({
+    type: 'tool_use',
+    id: 'call_empty_tc',
+    name: 'Bash',
+  })
+})
+
+test('JSON fallback: empty tool_calls does not block raw-text recovery on array content', async () => {
+  // Companion to the string-content case above: the array-content branch must
+  // also treat tool_calls: [] as "no structured tool calls" so raw recovery runs.
+  const events = await collectFallbackEvents({
+    id: 'chatcmpl-json-empty-tc-array',
+    model: 'fake-model',
+    choices: [
+      {
+        message: {
+          role: 'assistant',
+          tool_calls: [],
+          content: [
+            { type: 'text', text: 'Tool calls requested:' },
+            { type: 'text', text: '- Bash({"command":"ls"}) [id: call_empty_tc_arr]' },
+          ],
+        },
+        finish_reason: 'stop',
+      },
+    ],
+  })
+  const toolStart = events.find(
+    event =>
+      event.type === 'content_block_start' &&
+      typeof event.content_block === 'object' &&
+      event.content_block !== null &&
+      (event.content_block as Record<string, unknown>).type === 'tool_use',
+  ) as { content_block?: Record<string, unknown> } | undefined
+  expect(toolStart?.content_block).toMatchObject({
+    type: 'tool_use',
+    id: 'call_empty_tc_arr',
+    name: 'Bash',
+  })
 })
